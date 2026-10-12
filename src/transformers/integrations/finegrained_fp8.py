@@ -251,7 +251,6 @@ def _reference_batched_matmul(
     return torch.bmm(w, input.unsqueeze(-1)).squeeze(-1)
 
 
-@deprecate_kwarg("output_dtype", version="v5.16")
 def finegrained_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
