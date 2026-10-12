@@ -20,6 +20,7 @@ from ..cache_utils import (
     DynamicLayer,
     DynamicSlidingWindowLayer,
     EncoderDecoderCache,
+    LinearAttentionLayer,
     StaticCache,
     StaticLayer,
     StaticSlidingWindowLayer,
@@ -531,11 +532,65 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
         # We need this call to initialize all the layers (otherwise it's done lazily, which is not exportable)
         self.static_cache.early_initialization(batch_size, num_heads, head_dim, dtype, device)
 
+        # Layers without a key/value cache (linear attention, short convs, n-gram
+        # context) size their states lazily on first use, which export cannot see.
+        # One single-token forward runs that initialization (on the meta device it
+        # is shapes only); the states are then registered as buffers like keys and
+        # values, and the "has previous state" flags are reset so that the first
+        # exported call behaves as a prefill (see `set_has_previous_state`).
+        self._linear_layers = [
+            (i, layer) for i, layer in enumerate(self.static_cache.layers) if isinstance(layer, LinearAttentionLayer)
+        ]
+        if self._linear_layers:
+            # On the meta device data-dependent ops (nonzero) have no result; let them
+            # assume a full-size result, which is all the state sizing needs.
+            import torch.fx.experimental._config as fx_config
+
+            previous = getattr(fx_config, "meta_nonzero_assume_all_nonzero", None)
+            if previous is not None:
+                fx_config.meta_nonzero_assume_all_nonzero = True
+            try:
+                with torch.no_grad():
+                    self._warmup_forward(batch_size, device)
+            finally:
+                if previous is not None:
+                    fx_config.meta_nonzero_assume_all_nonzero = previous
+            self.set_has_previous_state(False)
+            for i, layer in self._linear_layers:
+                for j, state in layer.conv_states.items():
+                    if state is not None:
+                        self.register_buffer(f"conv_state_{i}_{j}", state, persistent=False)
+                for j, state in layer.recurrent_states.items():
+                    if state is not None:
+                        self.register_buffer(f"recurrent_state_{i}_{j}", state, persistent=False)
+            # The warm-up may have attached growing Python-side state to the cache
+            # (e.g. full position ids); drop it so export starts from a clean cache.
+            if hasattr(self.static_cache, "position_ids"):
+                del self.static_cache.position_ids
+
         # Register cache buffers to make them exportable
         for i, layer in enumerate(self.static_cache.layers):
+            if isinstance(layer, LinearAttentionLayer):
+                continue
             self.register_buffer(f"key_cache_{i}", layer.keys, persistent=False)
             self.register_buffer(f"value_cache_{i}", layer.values, persistent=False)
             self.register_buffer(f"cumulative_length_{i}", layer.cumulative_length, persistent=False)
+
+    def _warmup_forward(self, batch_size: int, device) -> None:
+        self.model(
+            input_ids=torch.zeros((batch_size, 1), dtype=torch.long, device=device),
+            cache_position=torch.zeros(1, dtype=torch.long, device=device),
+            past_key_values=self.static_cache,
+            use_cache=True,
+        )
+
+    def set_has_previous_state(self, flag: bool) -> None:
+        """Linear-attention layers branch in Python on whether a previous state exists
+        (prefill pads and overwrites, decode reads and updates). Export traces one branch,
+        so set `False` before exporting a prefill graph and `True` before a decode graph."""
+        for _, layer in self._linear_layers:
+            for k in layer.has_previous_state:
+                layer.has_previous_state[k] = flag
 
     def forward(
         self,
@@ -863,11 +918,65 @@ class Seq2SeqLMDecoderExportableModuleWithStaticCache(torch.nn.Module):
 
         register_dynamic_cache_export_support()
 
+        # Layers without a key/value cache (linear attention, short convs, n-gram
+        # context) size their states lazily on first use, which export cannot see.
+        # One single-token forward runs that initialization (on the meta device it
+        # is shapes only); the states are then registered as buffers like keys and
+        # values, and the "has previous state" flags are reset so that the first
+        # exported call behaves as a prefill (see `set_has_previous_state`).
+        self._linear_layers = [
+            (i, layer) for i, layer in enumerate(self.static_cache.layers) if isinstance(layer, LinearAttentionLayer)
+        ]
+        if self._linear_layers:
+            # On the meta device data-dependent ops (nonzero) have no result; let them
+            # assume a full-size result, which is all the state sizing needs.
+            import torch.fx.experimental._config as fx_config
+
+            previous = getattr(fx_config, "meta_nonzero_assume_all_nonzero", None)
+            if previous is not None:
+                fx_config.meta_nonzero_assume_all_nonzero = True
+            try:
+                with torch.no_grad():
+                    self._warmup_forward(batch_size, device)
+            finally:
+                if previous is not None:
+                    fx_config.meta_nonzero_assume_all_nonzero = previous
+            self.set_has_previous_state(False)
+            for i, layer in self._linear_layers:
+                for j, state in layer.conv_states.items():
+                    if state is not None:
+                        self.register_buffer(f"conv_state_{i}_{j}", state, persistent=False)
+                for j, state in layer.recurrent_states.items():
+                    if state is not None:
+                        self.register_buffer(f"recurrent_state_{i}_{j}", state, persistent=False)
+            # The warm-up may have attached growing Python-side state to the cache
+            # (e.g. full position ids); drop it so export starts from a clean cache.
+            if hasattr(self.static_cache, "position_ids"):
+                del self.static_cache.position_ids
+
         # Register cache buffers to make them exportable
         for i, layer in enumerate(self.static_cache.layers):
+            if isinstance(layer, LinearAttentionLayer):
+                continue
             self.register_buffer(f"key_cache_{i}", layer.keys, persistent=False)
             self.register_buffer(f"value_cache_{i}", layer.values, persistent=False)
             self.register_buffer(f"cumulative_length_{i}", layer.cumulative_length, persistent=False)
+
+    def _warmup_forward(self, batch_size: int, device) -> None:
+        self.model(
+            input_ids=torch.zeros((batch_size, 1), dtype=torch.long, device=device),
+            cache_position=torch.zeros(1, dtype=torch.long, device=device),
+            past_key_values=self.static_cache,
+            use_cache=True,
+        )
+
+    def set_has_previous_state(self, flag: bool) -> None:
+        """Linear-attention layers branch in Python on whether a previous state exists
+        (prefill pads and overwrites, decode reads and updates). Export traces one branch,
+        so set `False` before exporting a prefill graph and `True` before a decode graph."""
+        for _, layer in self._linear_layers:
+            for k in layer.has_previous_state:
+                layer.has_previous_state[k] = flag
 
     def forward(self, decoder_input_ids, encoder_hidden_states, cache_position):
         # Start by resetting static cache (it's needed to be able to run several generations with the same exported program,

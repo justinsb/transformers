@@ -206,6 +206,16 @@ def _reference_dequantize(
     return weight.to(dtype) * scale
 
 
+def _reference_compute_dtype(input: torch.Tensor) -> torch.dtype:
+    """The matmul dtype for the reference path: the activations' half dtype, else bf16.
+
+    Some models hand float32 activations to quantized layers (e.g. after a float32
+    mixer); the kernels quantize those to fp8 anyway, and `grouped_mm` only takes half
+    dtypes, so compute in bf16 and return in the input's dtype.
+    """
+    return input.dtype if input.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
+
+
 def _reference_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -215,10 +225,14 @@ def _reference_fp8_linear(
 ) -> torch.Tensor:
     """fp8 linear without kernels: dequantize the blocks, then F.linear.
 
-    Activations stay in `input.dtype` (no activation quantization), so this is slightly
+    Activations are not quantized (the half dtype is kept as is), so this is slightly
     *more* precise than the kernels, not less.
     """
-    return F.linear(input, _reference_dequantize(weight, weight_scale_inv, block_size, input.dtype), bias)
+    dtype = _reference_compute_dtype(input)
+    out = F.linear(input.to(dtype), _reference_dequantize(weight, weight_scale_inv, block_size, dtype))
+    if bias is not None:
+        out = out + bias.to(dtype)
+    return out.to(input.dtype)
 
 
 def _reference_grouped_matmul(
@@ -232,8 +246,9 @@ def _reference_grouped_matmul(
     row count per expert; each expert's `(N, K)` fp8 block is dequantized once."""
     from .moe import _grouped_mm
 
-    w = _reference_dequantize(weight, weight_scale_inv, block_size, input.dtype)  # (E, N, K)
-    return _grouped_mm(input, w.transpose(-2, -1), offsets)
+    dtype = _reference_compute_dtype(input)
+    w = _reference_dequantize(weight, weight_scale_inv, block_size, dtype)  # (E, N, K)
+    return _grouped_mm(input.to(dtype), w.transpose(-2, -1), offsets).to(input.dtype)
 
 
 def _reference_batched_matmul(
@@ -246,9 +261,10 @@ def _reference_batched_matmul(
 ) -> torch.Tensor:
     """Kernel-free `batched_matmul`: one `(N, K)` fp8 block per (token, expert) pair, gathered
     and dequantized. Sentinel ids (>= num_experts) compute against the last expert; the caller masks them."""
+    dtype = _reference_compute_dtype(input)
     ids = expert_ids.clamp(max=num_experts - 1)
-    w = _reference_dequantize(weight[ids], weight_scale_inv[ids], block_size, input.dtype)  # (S, N, K)
-    return torch.bmm(w, input.unsqueeze(-1)).squeeze(-1)
+    w = _reference_dequantize(weight[ids], weight_scale_inv[ids], block_size, dtype)  # (S, N, K)
+    return torch.bmm(w, input.to(dtype).unsqueeze(-1)).squeeze(-1).to(input.dtype)
 
 
 def finegrained_fp8_linear(
