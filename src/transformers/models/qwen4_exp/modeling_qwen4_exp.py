@@ -422,13 +422,10 @@ def torch_chunk_gated_delta_rule(
     last_recurrent_state = None if not output_final_state else last_recurrent_state
     # Reshape the output to the orignal shape: flatten the chunk dimension, then drop padding
     core_attn_out = core_attn_out.reshape(padded_output_shape)
-    if isinstance(sequence_length, torch.SymInt):
-        # A slice would be min(sequence_length, padded length), which the symbolic reasoner cannot resolve from the
-        # ceil-division above and then guards the sequence length; a gather has exactly `sequence_length` rows.
-        positions = torch.arange(sequence_length, device=core_attn_out.device)
-        core_attn_out = core_attn_out.index_select(2, positions)
-    else:
-        core_attn_out = core_attn_out[:, :, :sequence_length]
+    # A slice would be min(sequence_length, padded length), which the symbolic reasoner cannot resolve from the
+    # ceil-division above and then guards the sequence length; a gather has exactly `sequence_length` rows.
+    positions = torch.arange(sequence_length, device=core_attn_out.device)
+    core_attn_out = core_attn_out.index_select(2, positions)
     # Convert back to the original shape [batch_size, sequence_length, num_v_heads, v_head_dim] and dtype
     # (No memory_format request: with a symbolic sequence length the contiguity check would specialize it;
     # the caller reshapes, which copies as needed.)

@@ -458,6 +458,27 @@ class FP8Embedding(nn.Embedding):
         return rows.to(self.weight_scale.dtype) * self.weight_scale
 
 
+class FP8Embedding(nn.Embedding):
+    """An embedding table stored as fp8 with one per-tensor scale (``weight_scale``).
+
+    Some checkpoints ship very large tables this way (Qwen3.8's n-gram embedding: 320M rows).
+    The lookup gathers fp8 rows (through a byte view, so it needs no fp8 kernel) and
+    dequantizes only the rows read; the table stays fp8 in memory.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int | None = None):
+        nn.Module.__init__(self)
+        self.num_embeddings, self.embedding_dim, self.padding_idx = num_embeddings, embedding_dim, padding_idx
+        self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse = None, 2.0, False, False
+        self.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim, dtype=_FP8_DTYPE), requires_grad=False)
+        self.weight_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        rows = torch.index_select(self.weight.view(torch.uint8), 0, input.reshape(-1))
+        rows = rows.view(_FP8_DTYPE).to(torch.bfloat16) * self.weight_scale.to(torch.bfloat16)
+        return rows.view(*input.shape, self.embedding_dim)
+
+
 class FP8GroupedLinear(FP8Linear):
     """FP8 drop-in for block-diagonal grouped linears.
 
