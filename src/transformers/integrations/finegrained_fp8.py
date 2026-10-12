@@ -176,6 +176,78 @@ def _alloc_expert_proj(
     return weight, sf
 
 
+def _use_reference_path(tensor: torch.Tensor) -> bool:
+    """True where the fp8 kernels cannot run: CPU, MPS, and the meta device
+    (torch.export traces on fake tensors that keep the meta device)."""
+    return tensor.device.type != "cuda"
+
+
+def _reference_dequantize(
+    weight: torch.Tensor, weight_scale_inv: torch.Tensor, block_size: list[int] | None, dtype: torch.dtype
+) -> torch.Tensor:
+    """Plain-torch block dequantization: fp8 `(..., N, K)` with per-block scales -> `dtype` `(..., N, K)`.
+
+    The reference counterpart of what the kernels do on the fly. Not fast, but it is
+    ordinary aten ops, so it runs on any device and traces under torch.export, and it
+    keeps the checkpoint's fp8 tensors as the module's parameters.
+    """
+    if weight.dtype != _FP8_DTYPE:
+        raise NotImplementedError(
+            "The reference fp8 path supports float8_e4m3fn weights only; FP4-packed weights need the kernels."
+        )
+    n, k = weight.shape[-2:]
+    bn, bk = (n, k) if block_size is None else block_size
+    scale = weight_scale_inv.to(dtype)
+    scale = scale.repeat_interleave(bn, dim=-2)[..., :n, :].repeat_interleave(bk, dim=-1)[..., :k]
+    return weight.to(dtype) * scale
+
+
+def _reference_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    block_size: list[int] | None,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """fp8 linear without kernels: dequantize the blocks, then F.linear.
+
+    Activations stay in `input.dtype` (no activation quantization), so this is slightly
+    *more* precise than the kernels, not less.
+    """
+    return F.linear(input, _reference_dequantize(weight, weight_scale_inv, block_size, input.dtype), bias)
+
+
+def _reference_grouped_matmul(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    offsets: torch.Tensor,
+    block_size: list[int] | None,
+) -> torch.Tensor:
+    """Kernel-free `grouped_matmul`: rows of `input` sorted by expert, `offsets` the cumulative
+    row count per expert; each expert's `(N, K)` fp8 block is dequantized once."""
+    from .moe import _grouped_mm
+
+    w = _reference_dequantize(weight, weight_scale_inv, block_size, input.dtype)  # (E, N, K)
+    return _grouped_mm(input, w.transpose(-2, -1), offsets)
+
+
+def _reference_batched_matmul(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    expert_ids: torch.Tensor,
+    block_size: list[int] | None,
+    num_experts: int,
+) -> torch.Tensor:
+    """Kernel-free `batched_matmul`: one `(N, K)` fp8 block per (token, expert) pair, gathered
+    and dequantized. Sentinel ids (>= num_experts) compute against the last expert; the caller masks them."""
+    ids = expert_ids.clamp(max=num_experts - 1)
+    w = _reference_dequantize(weight[ids], weight_scale_inv[ids], block_size, input.dtype)  # (S, N, K)
+    return torch.bmm(w, input.unsqueeze(-1)).squeeze(-1)
+
+
+@deprecate_kwarg("output_dtype", version="v5.16")
 def finegrained_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -191,6 +263,8 @@ def finegrained_fp8_linear(
     dispatcher routes FP4 (``int8``-packed) weights automatically. ``output_dtype``
     defaults to ``input.dtype`` when left ``None``.
     """
+    if _use_reference_path(weight):
+        return _reference_fp8_linear(input, weight, weight_scale_inv, block_size, bias)
     finegrained_fp8 = load_finegrained_fp8_kernel()
     output = finegrained_fp8.matmul(
         input,
@@ -421,15 +495,18 @@ class FP8GroupedLinear(FP8Linear):
         tokens_per_expert = torch.full((self.n_groups,), tokens_per_group, device=x.device, dtype=torch.int32)
         offsets = torch.arange(1, self.n_groups + 1, device=x.device, dtype=torch.int32) * tokens_per_group
 
-        finegrained_fp8 = load_finegrained_fp8_kernel()
-        y = finegrained_fp8.grouped_matmul(
-            x,
-            w,
-            scale_inv,
-            offsets=offsets,
-            tokens_per_expert=tokens_per_expert,
-            block_size=self.block_size,
-        )
+        if _use_reference_path(w):
+            y = _reference_grouped_matmul(x, w, scale_inv, offsets, self.block_size)
+        else:
+            finegrained_fp8 = load_finegrained_fp8_kernel()
+            y = finegrained_fp8.grouped_matmul(
+                x,
+                w,
+                scale_inv,
+                offsets=offsets,
+                tokens_per_expert=tokens_per_expert,
+                block_size=self.block_size,
+            )
         y = y.reshape(self.n_groups, *input_shape, -1).movedim(0, -2)
         if self.has_bias:
             y.add_(self.bias.view(self.n_groups, -1))
@@ -448,7 +525,7 @@ def fp8_batched_mm_experts_forward(
             "Use the default eager dispatch or switch to activation_scheme='dynamic'."
         )
 
-    finegrained_fp8 = load_finegrained_fp8_kernel()
+    finegrained_fp8 = None if _use_reference_path(hidden_states) else load_finegrained_fp8_kernel()
 
     num_top_k = top_k_index.size(-1)
     num_tokens = hidden_states.size(0)
@@ -471,13 +548,18 @@ def fp8_batched_mm_experts_forward(
     weight_scale_down = self.down_proj_scale_inv
 
     # --- Up projection per expert (FP8 batched) ---
-    proj_out = finegrained_fp8.batched_matmul(
-        selected_hidden_states,
-        weight_up,
-        weight_scale_up,
-        block_size=self.block_size,
-        expert_ids=expert_ids,
-    )  # (S, 2 * intermediate_dim) or (S, intermediate_dim) depending on gating
+    if finegrained_fp8 is None:
+        proj_out = _reference_batched_matmul(
+            selected_hidden_states, weight_up, weight_scale_up, expert_ids, self.block_size, self.num_experts
+        )
+    else:
+        proj_out = finegrained_fp8.batched_matmul(
+            selected_hidden_states,
+            weight_up,
+            weight_scale_up,
+            block_size=self.block_size,
+            expert_ids=expert_ids,
+        )  # (S, 2 * intermediate_dim) or (S, intermediate_dim) depending on gating
 
     # Apply gating or activation
     if self.has_gate:
@@ -488,13 +570,18 @@ def fp8_batched_mm_experts_forward(
         proj_out = self.act_fn(proj_out)  # (S, intermediate_dim)
 
     # --- Down projection per expert (FP8 batched) ---
-    proj_out = finegrained_fp8.batched_matmul(
-        proj_out,
-        weight_down,
-        weight_scale_down,
-        block_size=self.block_size,
-        expert_ids=expert_ids,
-    )  # (S, hidden_dim)
+    if finegrained_fp8 is None:
+        proj_out = _reference_batched_matmul(
+            proj_out, weight_down, weight_scale_down, expert_ids, self.block_size, self.num_experts
+        )
+    else:
+        proj_out = finegrained_fp8.batched_matmul(
+            proj_out,
+            weight_down,
+            weight_scale_down,
+            block_size=self.block_size,
+            expert_ids=expert_ids,
+        )  # (S, hidden_dim)
 
     # Apply routing weights
     weighted_out = proj_out * sample_weights.to(proj_out.dtype).unsqueeze(-1)  # (S, hidden_dim)
@@ -523,7 +610,7 @@ def fp8_grouped_mm_experts_forward(
             "Use the default eager dispatch or switch to activation_scheme='dynamic'."
         )
 
-    finegrained_fp8 = load_finegrained_fp8_kernel()
+    finegrained_fp8 = None if _use_reference_path(hidden_states) else load_finegrained_fp8_kernel()
 
     device = hidden_states.device
     num_top_k = top_k_index.size(-1)
@@ -542,7 +629,8 @@ def fp8_grouped_mm_experts_forward(
     # Compute offsets for grouped processing.
     # histc instead of bincount avoids cuda-graph issues;
     # CPU requires float input, CUDA requires int input (deterministic mode).
-    histc_input = expert_ids_g.float() if device.type == "cpu" else expert_ids_g.int()
+    # (float off the GPU, including the meta device, so an exported graph runs on the CPU)
+    histc_input = expert_ids_g.int() if device.type == "cuda" else expert_ids_g.float()
     tokens_per_expert = torch.histc(histc_input, bins=self.num_experts, min=0, max=self.num_experts - 1)
     offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
 
@@ -560,14 +648,17 @@ def fp8_grouped_mm_experts_forward(
     weight_scale_down = self.down_proj_scale_inv
 
     # --- Up projection per expert (FP8 grouped) ---
-    proj_out = finegrained_fp8.grouped_matmul(
-        selected_hidden_states_g,
-        weight_up,
-        weight_scale_up,
-        offsets=offsets,
-        tokens_per_expert=tokens_per_expert,
-        block_size=self.block_size,
-    )  # (S, 2 * intermediate_dim)
+    if finegrained_fp8 is None:
+        proj_out = _reference_grouped_matmul(selected_hidden_states_g, weight_up, weight_scale_up, offsets, self.block_size)
+    else:
+        proj_out = finegrained_fp8.grouped_matmul(
+            selected_hidden_states_g,
+            weight_up,
+            weight_scale_up,
+            offsets=offsets,
+            tokens_per_expert=tokens_per_expert,
+            block_size=self.block_size,
+        )  # (S, 2 * intermediate_dim)
 
     # Apply gating or activation
     if self.has_gate:
@@ -578,14 +669,17 @@ def fp8_grouped_mm_experts_forward(
         proj_out = self.act_fn(proj_out)  # (S, intermediate_dim)
 
     # --- Down projection per expert (FP8 grouped) ---
-    proj_out = finegrained_fp8.grouped_matmul(
-        proj_out,
-        weight_down,
-        weight_scale_down,
-        offsets=offsets,
-        tokens_per_expert=tokens_per_expert,
-        block_size=self.block_size,
-    )  # (S, hidden_dim)
+    if finegrained_fp8 is None:
+        proj_out = _reference_grouped_matmul(proj_out, weight_down, weight_scale_down, offsets, self.block_size)
+    else:
+        proj_out = finegrained_fp8.grouped_matmul(
+            proj_out,
+            weight_down,
+            weight_scale_down,
+            offsets=offsets,
+            tokens_per_expert=tokens_per_expert,
+            block_size=self.block_size,
+        )  # (S, hidden_dim)
 
     # Apply routing weights
     weighted_out = proj_out * sample_weights_g.to(proj_out.dtype).unsqueeze(-1)  # (S, hidden_dim)
