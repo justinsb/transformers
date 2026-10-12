@@ -36,10 +36,15 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
 
         if not torch.cuda.is_available() and not is_torch_xpu_available():
             if self.pre_quantized:
+                # The fp8 modules have a plain-torch path off the GPU (see integrations/finegrained_fp8.py):
+                # weights stay fp8 and are dequantized block by block during compute. Slow, but it is
+                # the model as published, at the checkpoint's memory size; pass dequantize=True for
+                # bf16 weights instead.
                 logger.warning_once(
-                    "Using FP8 quantized models requires a GPU or XPU, we will default to dequantizing the model to bf16 since no GPU or XPU is available"
+                    "No GPU or XPU found: FP8 weights will be dequantized on the fly on each forward "
+                    "(slow). Pass `quantization_config=FineGrainedFP8Config(dequantize=True)` to "
+                    "convert the weights to bf16 once at load time instead."
                 )
-                self.quantization_config.dequantize = True
                 return
             else:
                 raise RuntimeError("No GPU or XPU found. A GPU or XPU is needed for FP8 quantization.")

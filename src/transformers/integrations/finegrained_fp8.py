@@ -196,9 +196,13 @@ def _reference_dequantize(
         raise NotImplementedError(
             "The reference fp8 path supports float8_e4m3fn weights only; FP4-packed weights need the kernels."
         )
-    n, k = weight.shape[-2:]
+    *lead, n, k = weight.shape
     bn, bk = (n, k) if block_size is None else block_size
     scale = weight_scale_inv.to(dtype)
+    if n % bn == 0 and k % bk == 0:
+        # Whole blocks: a broadcast multiply over a blocked view, no expanded scale tensor.
+        w = weight.to(dtype).reshape(*lead, n // bn, bn, k // bk, bk)
+        return (w * scale.reshape(*lead, n // bn, 1, k // bk, 1)).reshape(*lead, n, k)
     scale = scale.repeat_interleave(bn, dim=-2)[..., :n, :].repeat_interleave(bk, dim=-1)[..., :k]
     return weight.to(dtype) * scale
 
