@@ -634,6 +634,7 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
             inputs_embeds=inputs_embeds,
             attention_mask=None,
             past_key_values=past_key_values,
+            cache_position=cache_position,  # slots of the static cache; hybrid models index per-slot tables with it
             use_cache=True,
         )
         if hasattr(outs, "logits"):

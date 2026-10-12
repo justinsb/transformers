@@ -1078,12 +1078,15 @@ class LinearAttentionLayer(LinearAttentionCacheLayerMixin):
 
         # This is prefill, simply pad the conv_states if necessary
         if not self.has_previous_state[state_idx]:
-            full_conv_states = conv_states
             self.has_previous_state[state_idx] = True
-            # In this case, need to pad it to fit the conv_kernel_size
-            if not self.record_past and full_conv_states.shape[-1] < self.conv_kernel_size[state_idx]:
-                padding_length = self.conv_kernel_size[state_idx] - full_conv_states.shape[-1]
-                full_conv_states = torch.nn.functional.pad(full_conv_states, (padding_length, 0), value=0)
+            if self.record_past:
+                full_conv_states = conv_states
+            else:
+                # Prepend the (zero) state exactly as the cached path below does, instead of padding only when the
+                # input is shorter than the kernel: the callers keep the last `seq_len` conv outputs (or the last
+                # `conv_kernel_size` states), so this is the same computation, with no branch on the sequence
+                # length for torch.export to specialize.
+                full_conv_states = torch.cat([self.conv_states[state_idx], conv_states], dim=-1)
         # We need to return the concatenation of the current state and the full new one so that the causal conv can see the
         # correct left context - however we usually cache only the last part
         else:

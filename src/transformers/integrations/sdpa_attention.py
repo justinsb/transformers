@@ -121,7 +121,9 @@ def sdpa_attention_forward(
     #   operand, so `is_causal` can end up being that `SymBool` (e.g. the seamless_m4t / seamless_m4t_v2 speech
     #   encoders). Reordering the conditions fixes it but breaks the compile requirement above, so it should rather be
     #   handled on the exporter side. See https://github.com/huggingface/transformers/pull/46196#discussion_r3717333141
-    is_causal = q_length > 1 and attention_mask is None and is_causal
+    # (With a mask present the result is False whatever the length; evaluating `q_length > 1` first would guard a
+    # symbolic length under torch.export and specialize the prefill graph to lengths > 1 for nothing.)
+    is_causal = (q_length > 1) if (attention_mask is None and is_causal) else False
 
     # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
     # We convert it to a bool for the SDPA kernel that only accepts bools.

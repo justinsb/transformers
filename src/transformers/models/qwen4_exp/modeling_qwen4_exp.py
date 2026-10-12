@@ -20,6 +20,7 @@
 
 import itertools
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -292,7 +293,6 @@ def torch_chunk_gated_delta_rule(
     batch_size, sequence_length, _, k_head_dim = key.shape
     num_v_heads, v_head_dim = value.shape[-2:]
     recurrent_state_shape = (batch_size, num_v_heads, k_head_dim, v_head_dim)
-    padded_output_shape = (batch_size, num_v_heads, -1, v_head_dim)  # -1 is the padded sequence length
     decay = g  # rename for clarity: argument name must stay "g" to match flash_linear_attention's API
 
     # Make sure all tensors are fp32 and reshape them to [batch_size, num_*_heads, seqlen, ...]
@@ -309,12 +309,13 @@ def torch_chunk_gated_delta_rule(
     query = query * scaling
 
     # Pad sequence length to be a multiple of chunk_size. Padding is described as (left_pad, right_pad) for each dim.
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    # (Written as whole chunks first so that a symbolic sequence length divides evenly under torch.export.)
+    num_chunks = (sequence_length + chunk_size - 1) // chunk_size
+    total_sequence_length = num_chunks * chunk_size
+    pad_size = total_sequence_length - sequence_length
+    padded_output_shape = (batch_size, num_v_heads, total_sequence_length, v_head_dim)
     query, key, value = (F.pad(x, (0, 0, 0, pad_size)) for x in (query, key, value))
     beta, decay = (F.pad(x, (0, pad_size)) for x in (beta, decay))
-
-    total_sequence_length = sequence_length + pad_size
-    num_chunks = total_sequence_length // chunk_size
 
     # Apply beta to K and V, which is the "learning rate" of the recurrent state for a given token, ie. how much the new
     # state influence the old state. Beta is often normalized to (0, 1) where 0 = no update; 1 = overwrite old state.
@@ -323,9 +324,9 @@ def torch_chunk_gated_delta_rule(
 
     # Reshape all tensors to chunk the sequence dimension (adds a new dimension of size chunk_size)
     query, key, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, k_beta, v_beta)
+        x.reshape(x.shape[0], x.shape[1], num_chunks, chunk_size, x.shape[-1]) for x in (query, key, k_beta, v_beta)
     ]
-    decay = decay.reshape(decay.shape[0], decay.shape[1], -1, chunk_size)
+    decay = decay.reshape(decay.shape[0], decay.shape[1], num_chunks, chunk_size)
 
     # Create a chunk-sized strictly upper triangular mask, ie. the mask of what a causal chunk may not attend to
     strictly_upper_mask = torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device).triu(1)
@@ -351,8 +352,10 @@ def torch_chunk_gated_delta_rule(
     # reading the old state (k_cumdecay). In the update, the part of new_values that the old state already predicts is
     # subtracted out, so that only the correction is written to the recurrent state: this is the delta rule.
 
-    # Not all export targets support the fast triangular solver, so we build the inverse by forward substitution then
-    if not is_torchdynamo_exporting():
+    # The triangular solver is an aten op with CPU and CUDA kernels and exports as such. Export targets without it
+    # (ExecuTorch backends) can opt into the forward-substitution loop, whose in-place row writes specialize a
+    # symbolic chunk count under torch.export.
+    if not (is_torchdynamo_exporting() and os.environ.get("TRANSFORMERS_EXPORT_NO_TRIANGULAR_SOLVE") == "1"):
         new_values = torch.linalg.solve_triangular(ut_system, v_beta, upper=False, unitriangular=True)
         k_cumdecay = torch.linalg.solve_triangular(ut_system, decayed_k_beta, upper=False, unitriangular=True)
     else:
@@ -368,7 +371,7 @@ def torch_chunk_gated_delta_rule(
         last_recurrent_state = torch.zeros(recurrent_state_shape, dtype=new_values.dtype, device=new_values.device)
     else:
         last_recurrent_state = initial_state.to(new_values)
-    core_attn_out = torch.zeros_like(new_values)
+    core_attn_out = new_values.new_zeros(new_values.shape)  # contiguous (a loop carry must keep its layout)
 
     # Apply decay once rather than in each chunk
     query = query * cum_decay.exp().unsqueeze(-1)
@@ -376,22 +379,60 @@ def torch_chunk_gated_delta_rule(
     chunk_decay = cum_decay[..., -1].exp()[..., None, None]
 
     # Second phase: the sequential scan over chunks
-    for i in range(num_chunks):
+    def chunk_step(state, chunk):
+        q_i, k_i, k_cumdecay_i, v_i, intra_i, decay_i = chunk
+        decay_i = decay_i[..., None, None]  # (B, H) -> (B, H, 1, 1); concrete singletons broadcast under export
         # Compute attention output for the current chunk: add the read of the previous recurrent state
         # (inter_chunk_attn) with the within-chunk attention (intra_chunk_attn)
-        v_new = new_values[:, :, i] - k_cumdecay[:, :, i] @ last_recurrent_state
-        inter_chunk_attn = query[:, :, i] @ last_recurrent_state
-        core_attn_out[:, :, i] = inter_chunk_attn + intra_chunk_attn[:, :, i] @ v_new
+        v_new = v_i - k_cumdecay_i @ state
+        out_i = q_i @ state + intra_i @ v_new
         # Update the recurrent state: new recurrent state (S_t+1) = decayed old state (S_t * (I-βkk^T)) + update (βvk^T)
-        last_recurrent_state = last_recurrent_state * chunk_decay[:, :, i] + key[:, :, i].transpose(-1, -2) @ v_new
+        return state * decay_i + k_i.transpose(-1, -2) @ v_new, out_i
+
+    if torch.compiler.is_compiling() or torch.compiler.is_exporting():
+        # A recurrence over a number of chunks that depends on the sequence length. A Python loop would specialize
+        # the length, so use the `while_loop` higher-order op: one graph, a symbolic trip count, and each step picks
+        # its chunk with index_select (contiguous, so no stride reasoning on strided chunk views).
+        from torch._higher_order_ops.while_loop import while_loop
+
+        step_decay = chunk_decay[..., 0, 0]  # (B, H, num_chunks)
+
+        def cond_fn(i, state, out):
+            return i < num_chunks
+
+        def body_fn(i, state, out):
+            idx = i.reshape(1)
+            chunk = tuple(
+                x.index_select(2, idx).squeeze(2)
+                for x in (query, key, k_cumdecay, new_values, intra_chunk_attn, step_decay)
+            )
+            state, out_i = chunk_step(state, chunk)
+            return i + 1, state, out.index_copy(2, idx, out_i.unsqueeze(2))
+
+        i0 = torch.zeros((), dtype=torch.int64, device=query.device)
+        _, last_recurrent_state, core_attn_out = while_loop(cond_fn, body_fn, (i0, last_recurrent_state, core_attn_out))
+    else:
+        for i in range(num_chunks):
+            last_recurrent_state, core_attn_out[:, :, i] = chunk_step(
+                last_recurrent_state,
+                (query[:, :, i], key[:, :, i], k_cumdecay[:, :, i], new_values[:, :, i], intra_chunk_attn[:, :, i], chunk_decay[:, :, i, 0, 0]),
+            )
 
     # Discard the final state if not requested
     last_recurrent_state = None if not output_final_state else last_recurrent_state
     # Reshape the output to the orignal shape: flatten the chunk dimension, then drop padding
     core_attn_out = core_attn_out.reshape(padded_output_shape)
-    core_attn_out = core_attn_out[:, :, :sequence_length]
+    if isinstance(sequence_length, torch.SymInt):
+        # A slice would be min(sequence_length, padded length), which the symbolic reasoner cannot resolve from the
+        # ceil-division above and then guards the sequence length; a gather has exactly `sequence_length` rows.
+        positions = torch.arange(sequence_length, device=core_attn_out.device)
+        core_attn_out = core_attn_out.index_select(2, positions)
+    else:
+        core_attn_out = core_attn_out[:, :, :sequence_length]
     # Convert back to the original shape [batch_size, sequence_length, num_v_heads, v_head_dim] and dtype
-    core_attn_out = core_attn_out.transpose(1, 2).to(initial_dtype, memory_format=torch.contiguous_format)
+    # (No memory_format request: with a symbolic sequence length the contiguity check would specialize it;
+    # the caller reshapes, which copies as needed.)
+    core_attn_out = core_attn_out.transpose(1, 2).to(initial_dtype)
     return core_attn_out, last_recurrent_state
 
 
@@ -706,13 +747,13 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         else:
             current_cos, current_sin = full_cos[:, -seq_length:, :], full_sin[:, -seq_length:, :]
 
-        qk = self.index_qk_proj(hidden_states)
-        q, token_k = torch.split(
-            qk,
-            [self.index_n_heads * self.index_head_dim, self.index_kv_heads * self.index_head_dim],
-            dim=-1,
+        # Split heads first, then queries from keys along the head dim: views of a contiguous projection, so a
+        # symbolic sequence length needs no stride reasoning under torch.export.
+        qk = self.index_qk_proj(hidden_states).view(
+            batch_size, seq_length, self.index_n_heads + self.index_kv_heads, self.index_head_dim
         )
-        q, raw_keys = q.reshape(*hidden_shape), token_k.reshape(*hidden_shape).squeeze(2)
+        q, token_k = torch.split(qk, [self.index_n_heads, self.index_kv_heads], dim=2)
+        raw_keys = token_k.squeeze(2)
         q = self.q_layernorm(q)
         q = apply_rotary_pos_emb(q, cos=current_cos, sin=current_sin, unsqueeze_dim=2)
 
@@ -1205,14 +1246,10 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         if past_key_values is not None:
             input_ids_to_cache = input_ids
             # In the case where `input_ids` would be smaller than `self.context_len`, the `update_conv_state` will pad with zeros, whereas
-            # here we want to pad with eos, so we do it explicitly
-            if (
-                not past_key_values.has_previous_state(self.layer_idx, state_idx=2)
-                and input_ids.shape[1] < self.context_len
-            ):
-                input_ids_to_cache = torch.nn.functional.pad(
-                    input_ids_to_cache, (self.context_len - input_ids.shape[1], 0), value=self.eos_token_id
-                )
+            # here we want to pad with eos, so we prepend the eos-filled context (the cache keeps the last `context_len`
+            # ids, so this is a no-op when `input_ids` is long enough, and needs no branch on the sequence length)
+            if not past_key_values.has_previous_state(self.layer_idx, state_idx=2):
+                input_ids_to_cache = torch.cat([previous_context, input_ids_to_cache], dim=-1)
             _ = past_key_values.update_conv_state(
                 input_ids_to_cache, self.layer_idx, state_idx=2, conv_kernel_size=self.context_len
             )
