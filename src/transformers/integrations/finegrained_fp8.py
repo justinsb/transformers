@@ -207,11 +207,11 @@ def _reference_dequantize(
 
 
 def _reference_compute_dtype(input: torch.Tensor) -> torch.dtype:
-    """The matmul dtype for the reference path: the activations' half dtype, else bf16.
+    """The matmul and output dtype for the reference path: the activations' half dtype, else bf16.
 
     Some models hand float32 activations to quantized layers (e.g. after a float32
-    mixer); the kernels quantize those to fp8 anyway, and `grouped_mm` only takes half
-    dtypes, so compute in bf16 and return in the input's dtype.
+    mixer); the kernels quantize those to fp8 anyway and DeepGEMM returns bf16, and
+    `grouped_mm` only takes half dtypes, so compute and return in bf16 like the kernels.
     """
     return input.dtype if input.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
 
@@ -232,7 +232,7 @@ def _reference_fp8_linear(
     out = F.linear(input.to(dtype), _reference_dequantize(weight, weight_scale_inv, block_size, dtype))
     if bias is not None:
         out = out + bias.to(dtype)
-    return out.to(input.dtype)
+    return out
 
 
 def _reference_grouped_matmul(
@@ -248,7 +248,7 @@ def _reference_grouped_matmul(
 
     dtype = _reference_compute_dtype(input)
     w = _reference_dequantize(weight, weight_scale_inv, block_size, dtype)  # (E, N, K)
-    return _grouped_mm(input.to(dtype), w.transpose(-2, -1), offsets).to(input.dtype)
+    return _grouped_mm(input.to(dtype), w.transpose(-2, -1), offsets)
 
 
 def _reference_batched_matmul(
@@ -264,7 +264,7 @@ def _reference_batched_matmul(
     dtype = _reference_compute_dtype(input)
     ids = expert_ids.clamp(max=num_experts - 1)
     w = _reference_dequantize(weight[ids], weight_scale_inv[ids], block_size, dtype)  # (S, N, K)
-    return torch.bmm(w, input.to(dtype).unsqueeze(-1)).squeeze(-1).to(input.dtype)
+    return torch.bmm(w, input.to(dtype).unsqueeze(-1)).squeeze(-1)
 
 
 def finegrained_fp8_linear(

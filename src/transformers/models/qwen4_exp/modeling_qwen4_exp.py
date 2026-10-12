@@ -29,7 +29,7 @@ from torch import nn
 
 from ... import initialization as init
 from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache
+from ...cache_utils import Cache, DynamicCache, StaticCache
 from ...generation import GenerationMixin
 from ...integrations import (
     use_experts_implementation,
@@ -695,12 +695,16 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor,
         past_key_values: Cache | None,
+        cache_position: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_length, _ = hidden_states.shape
         hidden_shape = (batch_size, seq_length, -1, self.index_head_dim)
         # The cos/sin here are the full positions for the keys, so we need to slice to get only the current positions for the queries
         full_cos, full_sin = position_embeddings
-        current_cos, current_sin = full_cos[:, -seq_length:, :], full_sin[:, -seq_length:, :]
+        if cache_position is not None:  # static cache: tables cover every slot, queries sit at cache_position
+            current_cos, current_sin = full_cos[:, cache_position, :], full_sin[:, cache_position, :]
+        else:
+            current_cos, current_sin = full_cos[:, -seq_length:, :], full_sin[:, -seq_length:, :]
 
         qk = self.index_qk_proj(hidden_states)
         q, token_k = torch.split(
@@ -717,6 +721,8 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
 
         # Note that the mask is never None here as we only allow eager and sdpa, and we do not allow sdpa's mask skip
         # It's always 4D with either bool (sdpa) or float (eager) and already gives us the valid indices
+        if cache_position is not None:
+            return self._static_selection(q, raw_keys, full_cos, full_sin, cache_position, attention_mask)
         visible_token_indices = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
 
         selected_token_indices = torch.full(
@@ -776,6 +782,56 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
             selected_token_mask = torch.where(selected_token_mask, attention_mask.new_zeros(()), min_dtype)
 
         return selected_token_mask
+
+    def _static_selection(
+        self,
+        q: torch.Tensor,
+        raw_keys: torch.Tensor,
+        full_cos: torch.Tensor,
+        full_sin: torch.Tensor,
+        cache_position: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """The same selection as the loop above, with static shapes, for a static cache.
+
+        Slot `i` of the cache is position `i` and visibility is causal, so for a query at position `p` the complete
+        blocks are the first `(p + 1) // compress_ratio` blocks of the cache and the tail is `[blocks * ratio, p]`.
+        Every block of the cache is pooled and scored; blocks beyond a query's complete ones are masked out of its
+        top-k. No data-dependent shapes, so this traces under torch.export and compiles.
+        """
+        batch_size, seq_length = q.shape[:2]
+        ratio, kv_length = self.compress_ratio, raw_keys.shape[1]
+        num_blocks = kv_length // ratio
+        device = q.device
+
+        keys = raw_keys[:, : num_blocks * ratio].view(batch_size, num_blocks, ratio, self.index_head_dim)
+        pooled_keys = self.k_layernorm(keys.float().mean(dim=2).to(raw_keys.dtype))  # (B, nb, d)
+        block_cos = full_cos[:, : num_blocks * ratio : ratio]  # rotary at each block's first position
+        block_sin = full_sin[:, : num_blocks * ratio : ratio]
+        block_keys = apply_rotary_pos_emb(pooled_keys.unsqueeze(2), cos=block_cos, sin=block_sin, unsqueeze_dim=2)
+        block_keys = block_keys.squeeze(2)  # (B, nb, d)
+
+        scores = torch.einsum("bshd,bnd->bsnh", q.float(), block_keys.float())
+        scores = torch.relu(scores).sum(dim=-1) / math.sqrt(self.index_head_dim)  # (B, S, nb), all >= 0
+
+        num_complete = (cache_position + 1) // ratio  # (S,)
+        block_ids = torch.arange(num_blocks, device=device)
+        complete = block_ids[None, :] < num_complete[:, None]  # (S, nb)
+        scores = torch.where(complete[None], scores, scores.new_full((), -1.0))  # -1 < any relu score
+        top = scores.topk(min(self.block_topk, num_blocks), dim=-1)
+        chosen_blocks = torch.zeros_like(scores, dtype=torch.bool).scatter(-1, top.indices, top.values >= 0)
+        selected = chosen_blocks.repeat_interleave(ratio, dim=-1)  # (B, S, nb * ratio)
+        if selected.shape[-1] < kv_length:
+            selected = F.pad(selected, (0, kv_length - selected.shape[-1]), value=False)
+
+        slots = torch.arange(kv_length, device=device)
+        tail = (slots[None, :] >= (num_complete * ratio)[:, None]) & (slots[None, :] <= cache_position[:, None])
+        selected_token_mask = (selected | tail[None]).unsqueeze(1)  # (B, 1, S, kv_length)
+        if attention_mask.is_floating_point():
+            min_dtype = torch.finfo(attention_mask.dtype).min
+            selected_token_mask = torch.where(selected_token_mask, attention_mask.new_zeros(()), min_dtype)
+        return selected_token_mask
+
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -851,7 +907,11 @@ class Qwen4ExpTextAttention(nn.Module):
         past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        selected_token_mask = self.indexer(hidden_states, position_embeddings, attention_mask, past_key_values)
+        cache_position = kwargs.get("cache_position")
+        static_cache = isinstance(past_key_values, StaticCache) and cache_position is not None
+        selected_token_mask = self.indexer(
+            hidden_states, position_embeddings, attention_mask, past_key_values, cache_position if static_cache else None
+        )
         # Combine both masks (they are never None, and are always 4D with either bool for sdpa, or float for eager)
         if attention_mask.is_floating_point():
             attention_mask = attention_mask + selected_token_mask
@@ -859,7 +919,10 @@ class Qwen4ExpTextAttention(nn.Module):
             attention_mask = attention_mask & selected_token_mask
 
         # The cos/sin are the full positions here due to the indexer, so we need to slice to get current positions
-        position_embeddings = (x[:, -hidden_states.shape[1] :, :] for x in position_embeddings)
+        if static_cache:
+            position_embeddings = (x[:, cache_position, :] for x in position_embeddings)
+        else:
+            position_embeddings = (x[:, -hidden_states.shape[1] :, :] for x in position_embeddings)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -877,6 +940,9 @@ class Qwen4ExpTextAttention(nn.Module):
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+            # The residual stream is float32 (hyper connections), so the rotated query is too; a
+            # static cache holds keys/values in the model dtype. Attention needs one dtype.
+            query_states = query_states.to(key_states.dtype)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -1445,7 +1511,13 @@ class Qwen4ExpTextModel(Qwen4ExpPreTrainedModel):
 
         # We need the full position_ids in the indexer, not just the current ones, so bind them to the cache if any (as they
         # are 3D, it's otherwise not easy to compute them back from only current positions)
-        if past_key_values is not None:
+        if isinstance(past_key_values, StaticCache):
+            # A static cache has fixed slots: build the rotary tables for every slot (slot i is position i) and let
+            # the attention/indexer pick the current ones by `cache_position`. Nothing grows, so this traces.
+            max_cache_len = next(layer.max_cache_len for layer in past_key_values.layers if hasattr(layer, "max_cache_len"))
+            position_ids = torch.arange(max_cache_len, device=inputs_embeds.device).view(1, 1, -1)
+            position_ids = position_ids.expand(3, inputs_embeds.shape[0], -1)
+        elif past_key_values is not None:
             if hasattr(past_key_values, "position_ids"):
                 previous_positions = past_key_values.position_ids
                 position_ids = torch.cat([previous_positions, position_ids], dim=-1)

@@ -623,6 +623,8 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
         # as otherwise it's mutated in-place indefinitely - we cannot call reset in-between the `generate` as the program was
         # already exported)
         for layer in self.static_cache.layers:
+            if isinstance(layer, LinearAttentionLayer):
+                continue  # no sequence position: its states are overwritten in place
             layer.cumulative_length.copy_(cache_position[0])
 
         past_key_values = self.static_cache
